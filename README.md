@@ -1,12 +1,13 @@
 # Ami-File
-Converter:
+## Converter:
 
-Input: .png, .jpg, .jpeg, .bmp, .gif, .tiff, .webp, .ico, and .ppm
+**Input:** .png, .jpg, .jpeg, .bmp, .gif, .tiff, .webp, .ico, and .ppm
 
-Output: .png, .jpeg, .gif, .webp, .bmp, .tiff
+**Output:** .png, .jpeg, .gif, .webp, .bmp, .tiff
 
-Merge:
 
-Input: .png, .jpeg, .gif, .bmp
+## Merge:
 
-Output: .png
+**Input:** .png, .jpeg, .gif, .bmp
+
+**Output:** .png
