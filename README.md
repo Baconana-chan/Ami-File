@@ -1,5 +1,5 @@
 # Ami-File
-Converter:
+Converter:\n
 Input: .png, .jpg, .jpeg, .bmp, .gif, .tiff, .webp, .ico, and .ppm
 Output: .png, .jpeg, .gif, .webp, .bmp, .tiff
 
