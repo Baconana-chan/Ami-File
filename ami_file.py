@@ -1,9 +1,334 @@
-import customtkinter as ctk
+import sys
 import os
 import json
+import time
+import concurrent.futures
 from tkinter import filedialog, messagebox
-from wand.image import Image
-from wand.color import Color
+import customtkinter as ctk
+import threading
+
+# Устанавливаем путь к ImageMagick
+IMAGEMAGICK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ImageMagick")
+if getattr(sys, 'frozen', False):
+    # Если запускается из exe
+    IMAGEMAGICK_PATH = os.path.join(sys._MEIPASS, "ImageMagick")
+os.environ['MAGICK_HOME'] = IMAGEMAGICK_PATH
+os.environ['PATH'] = f"{IMAGEMAGICK_PATH};{os.environ['PATH']}"
+
+# Флаги доступности библиотек
+HAVE_PIL = True
+HAVE_CV2 = True
+HAVE_WAND = True
+HAVE_VIPS = True
+
+# Пробуем импортировать библиотеки с обработкой ошибок
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    HAVE_PIL = False
+    print("PIL not available")
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    HAVE_CV2 = False
+    print("OpenCV not available")
+
+try:
+    from wand.image import Image as WandImage
+    from wand.color import Color
+    from wand.api import library
+except ImportError:
+    HAVE_WAND = False
+    print("ImageMagick/Wand not available")
+
+try:
+    import pyvips
+except ImportError:
+    HAVE_VIPS = False
+    print("Pyvips not available")
+
+# Проверяем и выводим информацию о доступных библиотеках
+print(f"Available libraries: PIL={HAVE_PIL}, OpenCV={HAVE_CV2}, Wand={HAVE_WAND}, Vips={HAVE_VIPS}")
+print(f"ImageMagick path: {IMAGEMAGICK_PATH}")
+
+# Проверяем, есть ли хотя бы одна библиотека для работы с изображениями
+if not any([HAVE_PIL, HAVE_CV2, HAVE_WAND, HAVE_VIPS]):
+    messagebox.showerror(
+        "Error",
+        "No image processing libraries found!\n"
+        "Please install at least one of:\n"
+        "- Pillow (pip install Pillow)\n"
+        "- OpenCV (pip install opencv-python)\n"
+        "- Wand (pip install Wand)\n"
+        "- Pyvips (pip install pyvips)"
+    )
+    sys.exit(1)
+
+# Поддерживаемые форматы для каждой библиотеки
+SUPPORTED_FORMATS = {
+    'wand': {
+        'input': {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff', 'webp', 'svg', 
+                 'pdf', 'eps', 'psd', 'heic', 'avif', 'jpegxl', 'ico', 'ppm',
+                 'rla', 'pcx', 'pnm', 'xbm', 'tga', 'djvu'},
+        'output': {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff', 'webp', 'svg', 
+                 'pdf', 'eps', 'psd', 'heic', 'avif', 'jpegxl', 'ico', 'ppm',
+                 'rla', 'pcx', 'pnm', 'xbm', 'tga', 'djvu'}
+    },
+    'pil': {
+        'input': {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff', 'webp', 'ico', 'ppm'},
+        'output': {'png', 'jpg', 'jpeg', 'bmp', 'gif', 'tiff', 'webp', 'ico'}
+    },
+    'cv2': {
+        'input': {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'webp'},
+        'output': {'png', 'jpg', 'jpeg', 'bmp', 'tiff', 'webp'}
+    },
+    'vips': {
+        'input': {'png', 'jpg', 'jpeg', 'webp', 'tiff', 'gif', 'pdf', 'svg', 'heif', 'avif'},
+        'output': {'png', 'jpg', 'jpeg', 'webp', 'tiff', 'gif', 'heif', 'avif'}
+    }
+}
+
+class ProcessingLibrary:
+    WAND = "wand"
+    PIL = "pil"
+    CV2 = "cv2"
+    VIPS = "vips"
+
+def convert_image(args):
+    """Оптимизированная функция конвертации с резервными вариантами"""
+    input_path, output_path, output_format, needs_alpha_removal = args
+    
+    # Пробуем разные библиотеки по порядку
+    errors = []
+    
+    # 1. Попытка использовать PIL
+    if HAVE_PIL:
+        try:
+            with PILImage.open(input_path) as img:
+                if needs_alpha_removal and img.mode == 'RGBA':
+                    background = PILImage.new('RGB', img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[3])
+                    background.save(output_path, format=output_format.upper())
+                else:
+                    img.save(output_path, format=output_format.upper())
+            return True
+        except Exception as e:
+            errors.append(f"PIL: {str(e)}")
+    
+    # 2. Попытка использовать OpenCV
+    if HAVE_CV2:
+        try:
+            img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                if needs_alpha_removal and img.shape[-1] == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                cv2.imwrite(output_path, img)
+                return True
+        except Exception as e:
+            errors.append(f"OpenCV: {str(e)}")
+    
+    # 3. Попытка использовать Wand
+    if HAVE_WAND:
+        try:
+            with WandImage(filename=input_path) as img:
+                if needs_alpha_removal and img.alpha_channel:
+                    with Color('white') as background:
+                        img.background_color = background
+                        img.alpha_channel = 'remove'
+                img.format = output_format.upper()
+                img.save(filename=output_path)
+            return True
+        except Exception as e:
+            errors.append(f"Wand: {str(e)}")
+    
+    # 4. Попытка использовать Pyvips
+    if HAVE_VIPS:
+        try:
+            image = pyvips.Image.new_from_file(input_path)
+            if needs_alpha_removal and image.hasalpha():
+                # Удаляем альфа-канал
+                image = image.flatten(background=[255, 255, 255])
+            
+            # Сохраняем с учетом формата
+            if output_format.lower() in ['jpg', 'jpeg']:
+                image.jpegsave(output_path, Q=95)
+            elif output_format.lower() == 'png':
+                image.pngsave(output_path)
+            elif output_format.lower() == 'webp':
+                image.webpsave(output_path, Q=95)
+            elif output_format.lower() == 'tiff':
+                image.tiffsave(output_path)
+            else:
+                image.write_to_file(output_path)
+            return True
+        except Exception as e:
+            errors.append(f"Vips: {str(e)}")
+    
+    # Если все методы не сработали, возвращаем ошибку
+    return (input_path, "\n".join(errors))
+
+def merge_images_optimized(images, direction='horizontal', output_path=None, output_format='png'):
+    """Оптимизированная функция слияния с резервными вариантами"""
+    errors = []
+    
+    # 1. Попытка использовать PIL
+    if HAVE_PIL:
+        try:
+            if direction == 'horizontal':
+                imgs = [PILImage.open(img) for img in images]
+                total_width = sum(img.width for img in imgs)
+                max_height = max(img.height for img in imgs)
+                merged_image = PILImage.new('RGB', (total_width, max_height), (255, 255, 255))
+                x_offset = 0
+                for img in imgs:
+                    merged_image.paste(img, (x_offset, 0))
+                    x_offset += img.width
+                    img.close()
+            else:
+                imgs = [PILImage.open(img) for img in images]
+                total_height = sum(img.height for img in imgs)
+                max_width = max(img.width for img in imgs)
+                merged_image = PILImage.new('RGB', (max_width, total_height), (255, 255, 255))
+                y_offset = 0
+                for img in imgs:
+                    merged_image.paste(img, (0, y_offset))
+                    y_offset += img.height
+                    img.close()
+            
+            if output_path:
+                merged_image.save(output_path, format=output_format.upper())
+            return merged_image
+        except Exception as e:
+            errors.append(f"PIL: {str(e)}")
+    
+    # 2. Попытка использовать OpenCV
+    if HAVE_CV2:
+        try:
+            cv_images = [cv2.imread(img) for img in images]
+            if direction == 'horizontal':
+                merged_image = np.hstack(cv_images)
+            else:
+                merged_image = np.vstack(cv_images)
+            cv2.imwrite(output_path, merged_image)
+            return True
+        except Exception as e:
+            errors.append(f"OpenCV: {str(e)}")
+    
+    # 3. Попытка использовать Wand
+    if HAVE_WAND:
+        try:
+            with WandImage() as merged_image:
+                with WandImage(filename=images[0]) as first:
+                    merged_image.format = first.format
+                    if direction == 'horizontal':
+                        for img_path in images[1:]:
+                            with WandImage(filename=img_path) as img:
+                                merged_image.sequence.append(img)
+                        merged_image.reset_sequence()
+                    else:
+                        for img_path in images[1:]:
+                            with WandImage(filename=img_path) as img:
+                                merged_image.sequence.extend(img.sequence)
+                if output_path:
+                    merged_image.save(filename=output_path)
+                return merged_image
+        except Exception as e:
+            errors.append(f"Wand: {str(e)}")
+    
+    # 4. Попытка использовать Pyvips
+    if HAVE_VIPS:
+        try:
+            # Загружаем изображения
+            vips_images = [pyvips.Image.new_from_file(img) for img in images]
+            
+            # Объединяем изображения
+            if direction == 'horizontal':
+                merged = pyvips.Image.arrayjoin(vips_images, across=len(vips_images))
+            else:
+                merged = pyvips.Image.arrayjoin(vips_images, across=1)
+            
+            # Сохраняем результат
+            if output_path:
+                if output_format.lower() in ['jpg', 'jpeg']:
+                    merged.jpegsave(output_path, Q=95)
+                elif output_format.lower() == 'png':
+                    merged.pngsave(output_path)
+                elif output_format.lower() == 'webp':
+                    merged.webpsave(output_path, Q=95)
+                elif output_format.lower() == 'tiff':
+                    merged.tiffsave(output_path)
+                else:
+                    merged.write_to_file(output_path)
+            return True
+        except Exception as e:
+            errors.append(f"Vips: {str(e)}")
+    
+    raise Exception("Failed to merge images using any method:\n" + "\n".join(errors))
+
+def batch_convert(conversion_args, progress_callback, batch_size=10):
+    """Обновленная версия с поддержкой расширенного прогресса"""
+    errors = []
+    total = len(conversion_args)
+    progress_info = ProgressInfo(total)
+    
+    for i in range(0, total, batch_size):
+        batch = conversion_args[i:i + batch_size]
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(os.cpu_count(), len(batch))) as executor:
+            futures = {executor.submit(convert_image, args): args[0] for args in batch}
+            
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                if isinstance(result, tuple):
+                    errors.append(result)
+                
+                progress_info.complete_file()
+                progress_callback(1.0, progress_info)  # Файл завершен
+                
+    return errors
+
+class ProgressInfo:
+    """Класс для хранения информации о прогрессе"""
+    def __init__(self, total_files):
+        self.total_files = total_files
+        self.processed_files = 0
+        self.current_file = 0
+        self.start_time = time.time()
+        self.file_start_time = time.time()
+        self.avg_file_time = 0
+        
+    def update_file_progress(self, progress):
+        """Обновляет прогресс текущего файла"""
+        self.current_file = progress
+        
+    def complete_file(self):
+        """Отмечает завершение обработки файла"""
+        self.processed_files += 1
+        current_time = time.time()
+        file_time = current_time - self.file_start_time
+        self.avg_file_time = (self.avg_file_time * (self.processed_files - 1) + file_time) / self.processed_files
+        self.file_start_time = current_time
+        
+    def get_eta(self):
+        """Возвращает расчетное время до завершения"""
+        if self.processed_files == 0:
+            return "Calculating..."
+        
+        elapsed_time = time.time() - self.start_time
+        files_left = self.total_files - self.processed_files
+        avg_time_per_file = elapsed_time / self.processed_files
+        eta_seconds = files_left * avg_time_per_file
+        
+        if eta_seconds < 60:
+            return f"{int(eta_seconds)}s"
+        elif eta_seconds < 3600:
+            return f"{int(eta_seconds/60)}m {int(eta_seconds%60)}s"
+        else:
+            hours = int(eta_seconds/3600)
+            minutes = int((eta_seconds%3600)/60)
+            return f"{hours}h {minutes}m"
 
 class Localization:
     TRANSLATIONS = {
@@ -53,6 +378,18 @@ class Localization:
             "github_link": "Open in browser",
             "visible_formats": "Visible Formats",
             "merge_output_format": "Merge Output Format",
+            # Progress bar translations
+            "progress_current": "Current file: ",
+            "progress_time": "Time per file: ",
+            "progress_overall": "Overall progress: ",
+            "progress_eta": "Estimated time remaining: ",
+            "calculating": "Calculating...",
+            
+            # Library descriptions
+            "recommended": "Recommended",
+            "basic_formats": "Basic formats",
+            "fast_standard": "Fast for standard formats",
+            "fast_large": "Fast for large images",
         },
         "ru": {
             # Settings tab
@@ -100,6 +437,18 @@ class Localization:
             "github_link": "Открыть в браузере",
             "visible_formats": "Видимые форматы",
             "merge_output_format": "Формат склеивания",
+            # Progress bar translations
+            "progress_current": "Текущий файл: ",
+            "progress_time": "Время на файл: ",
+            "progress_overall": "Общий прогресс: ",
+            "progress_eta": "Осталось времени: ",
+            "calculating": "Вычисление...",
+            
+            # Library descriptions
+            "recommended": "Рекомендуется",
+            "basic_formats": "Базовые форматы",
+            "fast_standard": "Быстрая для стандартных форматов",
+            "fast_large": "Быстрая для больших изображений",
         },
         "zh": {
             # Settings tab
@@ -146,7 +495,19 @@ class Localization:
             "github": "GitHub 仓库",
             "github_link": "在浏览器中打开",
             "visible_formats": "可见格式",
-            "merge_output_format": "合并输出格式"
+            "merge_output_format": "合并输出格式",
+            # Progress bar translations
+            "progress_current": "当前文件: ",
+            "progress_time": "每个文件的时间: ",
+            "progress_overall": "总体进度: ",
+            "progress_eta": "预计剩余时间: ",
+            "calculating": "计算中...",
+            
+            # Library descriptions
+            "recommended": "推荐",
+            "basic_formats": "基本格式",
+            "fast_standard": "标准格式快速",
+            "fast_large": "大图像快速",
         },
         "ja": {
             # Settings tab
@@ -193,7 +554,19 @@ class Localization:
             "github": "GitHub リポジトリ",
             "github_link": "ブラウザで開く",
             "visible_formats": "表示形式",
-            "merge_output_format": "結合出力形式"
+            "merge_output_format": "結合出力形式",
+            # Progress bar translations
+            "progress_current": "現在のファイル: ",
+            "progress_time": "ファイルごとの時間: ",
+            "progress_overall": "全体の進捗: ",
+            "progress_eta": "残り時間の見積もり: ",
+            "calculating": "計算中...",
+            
+            # Library descriptions
+            "recommended": "推奨",
+            "basic_formats": "基本フォーマット",
+            "fast_standard": "標準フォーマットの高速",
+            "fast_large": "大きな画像の高速",
         },
         "ko": {
             # Settings tab
@@ -240,7 +613,19 @@ class Localization:
             "github": "GitHub 저장소",
             "github_link": "브라우저에서 열기",
             "visible_formats": "표시 형식",
-            "merge_output_format": "병합 출력 형식"
+            "merge_output_format": "병합 출력 형식",
+            # Progress bar translations
+            "progress_current": "현재 파일: ",
+            "progress_time": "파일당 시간: ",
+            "progress_overall": "전체 진행 상황: ",
+            "progress_eta": "예상 남은 시간: ",
+            "calculating": "계산 중...",
+            
+            # Library descriptions
+            "recommended": "추천",
+            "basic_formats": "기본 형식",
+            "fast_standard": "표준 형식에 빠름",
+            "fast_large": "큰 이미지에 빠름",
         },
         "es": {
             # Settings tab
@@ -288,6 +673,18 @@ class Localization:
             "github_link": "Abrir en navegador",
             "visible_formats": "Formatos Visibles",
             "merge_output_format": "Formato de Salida de Fusión",
+            # Progress bar translations
+            "progress_current": "Archivo actual: ",
+            "progress_time": "Tiempo por archivo: ",
+            "progress_overall": "Progreso general: ",
+            "progress_eta": "Tiempo estimado restante: ",
+            "calculating": "Calculando...",
+            
+            # Library descriptions
+            "recommended": "Recomendado",
+            "basic_formats": "Formatos básicos",
+            "fast_standard": "Rápido para formatos estándar",
+            "fast_large": "Rápido para imágenes grandes",
         },
         "fr": {
             # Settings tab
@@ -335,6 +732,18 @@ class Localization:
             "github_link": "Ouvrir dans le navigateur",
             "visible_formats": "Formats Visibles",
             "merge_output_format": "Format de Sortie de Fusion",
+            # Progress bar translations
+            "progress_current": "Fichier actuel: ",
+            "progress_time": "Temps par fichier: ",
+            "progress_overall": "Progression globale: ",
+            "progress_eta": "Temps restant estimé: ",
+            "calculating": "Calcul...",
+            
+            # Library descriptions
+            "recommended": "Recommandé",
+            "basic_formats": "Formats de base",
+            "fast_standard": "Rapide pour les formats standard",
+            "fast_large": "Rapide pour les grandes images",
         },
         "de": {
             # Settings tab
@@ -382,6 +791,18 @@ class Localization:
             "github_link": "Im Browser öffnen",
             "visible_formats": "Sichtbare Formate",
             "merge_output_format": "Ausgabeformat Zusammenführung",
+            # Progress bar translations
+            "progress_current": "Aktuelle Datei: ",
+            "progress_time": "Zeit pro Datei: ",
+            "progress_overall": "Gesamtfortschritt: ",
+            "progress_eta": "Geschätzte verbleibende Zeit: ",
+            "calculating": "Berechnung...",
+            
+            # Library descriptions
+            "recommended": "Empfohlen",
+            "basic_formats": "Grundformate",
+            "fast_standard": "Schnell für Standardformate",
+            "fast_large": "Schnell für große Bilder",
         }
     }
 
@@ -403,6 +824,193 @@ class Localization:
     def set_language(self, language):
         self.current_language = language
 
+
+class ToolTip:
+    """Улучшенный класс для всплывающих подсказок"""
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip = None
+        self.show_timer = None
+        
+        self.widget.bind('<Enter>', self.enter)
+        self.widget.bind('<Leave>', self.leave)
+        self.widget.bind('<Destroy>', self.on_destroy)
+    
+    def enter(self, event=None):
+        # Отменяем предыдущий таймер если есть
+        self.cancel_timer()
+        # Запускаем новый таймер на появление подсказки
+        self.show_timer = self.widget.after(500, self.show_tooltip)
+    
+    def leave(self, event=None):
+        # Отменяем таймер и скрываем подсказку
+        self.cancel_timer()
+        self.hide_tooltip()
+    
+    def show_tooltip(self):
+        # Очищаем предыдущую подсказку если есть
+        self.hide_tooltip()
+        
+        # Создаем новую подсказку
+        x = self.widget.winfo_rootx() + self.widget.winfo_width() + 5
+        y = self.widget.winfo_rooty()
+        
+        self.tooltip = ctk.CTkToplevel()
+        self.tooltip.wm_overrideredirect(True)
+        self.tooltip.wm_geometry(f"+{x}+{y}")
+        
+        label = ctk.CTkLabel(
+            self.tooltip,
+            text=self.text,
+            justify="left",
+            wraplength=300
+        )
+        label.pack(padx=5, pady=5)
+        
+        # Делаем подсказку поверх других окон
+        self.tooltip.lift()
+        self.tooltip.attributes('-topmost', True)
+        
+        # Привязываем дополнительные обработчики
+        self.tooltip.bind('<Enter>', self.enter)
+        self.tooltip.bind('<Leave>', self.leave)
+    
+    def hide_tooltip(self):
+        if self.tooltip:
+            self.tooltip.destroy()
+            self.tooltip = None
+    
+    def cancel_timer(self):
+        if self.show_timer:
+            self.widget.after_cancel(self.show_timer)
+            self.show_timer = None
+    
+    def on_destroy(self, event=None):
+        self.hide_tooltip()
+        self.cancel_timer()
+
+def create_tooltip(widget, text):
+    """Создает всплывающую подсказку для виджета"""
+    return ToolTip(widget, text)
+
+class CustomDialog(ctk.CTkToplevel):
+    def __init__(self, parent, title, message, button_color="green", button_hover_color="#006400"):
+        super().__init__(parent)
+        self.title(title)
+        
+        # Make modal
+        self.transient(parent)
+        self.grab_set()
+        
+        # Center on parent
+        window_width = 400
+        window_height = 200
+        
+        # Get parent's center
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+        parent_width = parent.winfo_width()
+        parent_height = parent.winfo_height()
+        
+        # Calculate position
+        x = parent_x + (parent_width - window_width) // 2
+        y = parent_y + (parent_height - window_height) // 2
+        
+        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        self.resizable(False, False)
+        
+        # Message
+        label = ctk.CTkLabel(
+            self,
+            text=message,
+            wraplength=350,
+            justify="center"
+        )
+        label.pack(pady=20, padx=20)
+        
+        # OK button
+        button = ctk.CTkButton(
+            self,
+            text="OK",
+            command=self.destroy,
+            fg_color=button_color,
+            hover_color=button_hover_color
+        )
+        button.pack(pady=20)
+        
+        # Set focus and bind Enter
+        button.focus_set()
+        self.bind("<Return>", lambda e: self.destroy())
+
+class SelectionDialog(ctk.CTkToplevel):
+    def __init__(self, parent, title, message, command_yes, command_no):
+        super().__init__(parent)
+        self.title(title)
+        
+        # Make modal
+        self.transient(parent)
+        self.grab_set()
+        
+        # Center on parent
+        window_width = 400
+        window_height = 200
+        
+        # Get parent's center
+        parent_x = parent.winfo_x()
+        parent_y = parent.winfo_y()
+        parent_width = parent.winfo_width()
+        parent_height = parent.winfo_height()
+        
+        # Calculate position
+        x = parent_x + (parent_width - window_width) // 2
+        y = parent_y + (parent_height - window_height) // 2
+        
+        self.geometry(f"{window_width}x{window_height}+{x}+{y}")
+        self.resizable(False, False)
+        
+        # Message
+        label = ctk.CTkLabel(
+            self,
+            text=message,
+            wraplength=350,
+            justify="center"
+        )
+        label.pack(pady=20, padx=20)
+        
+        # Buttons frame
+        button_frame = ctk.CTkFrame(self, fg_color="transparent")
+        button_frame.pack(pady=20)
+        
+        # Yes button
+        yes_button = ctk.CTkButton(
+            button_frame,
+            text="Yes",
+            command=lambda: self.handle_choice(command_yes),
+            fg_color="green",
+            hover_color="#006400",
+            width=120
+        )
+        yes_button.pack(side="left", padx=10)
+        
+        # No button
+        no_button = ctk.CTkButton(
+            button_frame,
+            text="No",
+            command=lambda: self.handle_choice(command_no),
+            fg_color="gray",
+            hover_color="#4a4a4a",
+            width=120
+        )
+        no_button.pack(side="left", padx=10)
+        
+        # Set focus
+        yes_button.focus_set()
+        
+    def handle_choice(self, command):
+        self.destroy()
+        if command:
+            command()
 
 class AmiFile(ctk.CTk):
     def __init__(self):
@@ -438,14 +1046,19 @@ class AmiFile(ctk.CTk):
             "RLA", "PCX", "PNM", "XBM", "TGA", "DJVU"
         ])
         self.merge_format_var = ctk.StringVar(value=self.settings.get('merge_format', 'png'))
-        # Create tabs
+        self.processing_lib = ctk.StringVar(value=self.settings.get('processing_lib', ProcessingLibrary.WAND))
+        self.conversion_running = False
+        self.merge_running = False
+        # Создаем вкладки
         self.tabview = ctk.CTkTabview(self)
         self.tabview.pack(fill="both", expand=True, padx=20, pady=20)
-        # Add tabs
+        
+        # Добавляем вкладки
         self.tab_convert = self.tabview.add(self.loc.get("convert"))
         self.tab_merge = self.tabview.add(self.loc.get("merge"))
         self.tab_settings = self.tabview.add(self.loc.get("settings"))
-        # Setup tabs
+        
+        # Настраиваем вкладки
         self.setup_convert_tab()
         self.setup_merge_tab()
         self.setup_settings_tab()
@@ -475,6 +1088,8 @@ class AmiFile(ctk.CTk):
                     ]
                 if 'merge_format' not in self.settings:
                     self.settings['merge_format'] = 'png'
+                if 'processing_lib' not in self.settings:
+                    self.settings['processing_lib'] = ProcessingLibrary.WAND
         except FileNotFoundError:
             self.settings = {
                 'theme': 'dark',
@@ -484,7 +1099,8 @@ class AmiFile(ctk.CTk):
                     "EPS", "PSD", "HEIC", "AVIF", "JPEGXL", "ICO", "PPM",
                     "RLA", "PCX", "PNM", "XBM", "TGA", "DJVU"
                 ],
-                'merge_format': 'png'
+                'merge_format': 'png',
+                'processing_lib': ProcessingLibrary.WAND
             }
 
     def save_settings(self):
@@ -500,14 +1116,8 @@ class AmiFile(ctk.CTk):
         ctk.set_appearance_mode(self.theme_var.get())
         self.loc.set_language(self.language_var.get())
         
-        # Update interface
+        # Update interface and stay on settings tab
         self.refresh_interface()
-        
-        # Show success message
-        messagebox.showinfo(
-            self.loc.get("success"),
-            self.loc.get("settings_saved")
-        )
 
     def refresh_interface(self):
         """Полностью обновляет интерфейс при изменении настроек"""
@@ -528,6 +1138,9 @@ class AmiFile(ctk.CTk):
         self.tabview._tab_dict["Convert"].configure(text=self.loc.get("convert"))
         self.tabview._tab_dict["Merge"].configure(text=self.loc.get("merge"))
         self.tabview._tab_dict["Settings"].configure(text=self.loc.get("settings"))
+        
+        # Возвращаемся на вкладку настроек
+        self.tabview.set(self.loc.get("settings"))
 
     def update_interface(self):
         """Update the interface when settings change"""
@@ -686,6 +1299,110 @@ class AmiFile(ctk.CTk):
                 value=fmt.lower()
             ).pack(pady=2)
 
+        # Processing library selection with tooltips
+        library_frame = ctk.CTkFrame(settings_scroll)
+        library_frame.pack(fill="x", pady=10)
+        
+        header_frame = ctk.CTkFrame(library_frame, fg_color="transparent")
+        header_frame.pack(fill="x", pady=5)
+        
+        ctk.CTkLabel(
+            header_frame,
+            text=self.loc.get("processing_library")
+        ).pack(side="left", pady=5, padx=5)
+        
+        info_btn = ctk.CTkButton(
+            header_frame,
+            text="i",
+            width=20,
+            height=20,
+            corner_radius=10
+        )
+        info_btn.pack(side="left", padx=5)
+        
+        # Функция для форматирования строки с форматами
+        def format_supported_formats(formats):
+            return ", ".join(sorted(formats))
+        
+        # Создаем строки с поддерживаемыми форматами для каждой библиотеки
+        library_info = {
+            ProcessingLibrary.WAND: {
+                'name': f"ImageMagick/Wand ({self.loc.get('recommended')})",
+                'formats': SUPPORTED_FORMATS['wand']
+            },
+            ProcessingLibrary.PIL: {
+                'name': f"Pillow/PIL ({self.loc.get('basic_formats')})",
+                'formats': SUPPORTED_FORMATS['pil']
+            },
+            ProcessingLibrary.CV2: {
+                'name': f"OpenCV ({self.loc.get('fast_standard')})",
+                'formats': SUPPORTED_FORMATS['cv2']
+            },
+            ProcessingLibrary.VIPS: {
+                'name': f"Pyvips ({self.loc.get('fast_large')})",
+                'formats': SUPPORTED_FORMATS['vips']
+            }
+        }
+        
+        def create_library_tooltip():
+            tooltip_text = f"{self.loc.get('supported_formats')}:\n\n"
+            for lib_key, lib_info in library_info.items():
+                if getattr(sys.modules[__name__], f'HAVE_{lib_key.upper()}'):
+                    tooltip_text += f"{lib_info['name']}:\n"
+                    tooltip_text += f"{self.loc.get('input_formats')}"
+                    tooltip_text += format_supported_formats(lib_info['formats']['input'])
+                    tooltip_text += f"\n{self.loc.get('output_formats')}"
+                    tooltip_text += format_supported_formats(lib_info['formats']['output'])
+                    tooltip_text += "\n\n"
+            return tooltip_text
+        
+        create_tooltip(info_btn, create_library_tooltip())
+        
+        # Создаем радио-кнопки для каждой доступной библиотеки
+        if HAVE_WAND:
+            radio = ctk.CTkRadioButton(
+                library_frame,
+                text=library_info[ProcessingLibrary.WAND]['name'],
+                variable=self.processing_lib,
+                value=ProcessingLibrary.WAND,
+                command=self.update_format_visibility
+            )
+            radio.pack(pady=2)
+            create_tooltip(radio, format_supported_formats(library_info[ProcessingLibrary.WAND]['formats']['output']))
+        
+        if HAVE_PIL:
+            radio = ctk.CTkRadioButton(
+                library_frame,
+                text=library_info[ProcessingLibrary.PIL]['name'],
+                variable=self.processing_lib,
+                value=ProcessingLibrary.PIL,
+                command=self.update_format_visibility
+            )
+            radio.pack(pady=2)
+            create_tooltip(radio, format_supported_formats(library_info[ProcessingLibrary.PIL]['formats']['output']))
+        
+        if HAVE_CV2:
+            radio = ctk.CTkRadioButton(
+                library_frame,
+                text=library_info[ProcessingLibrary.CV2]['name'],
+                variable=self.processing_lib,
+                value=ProcessingLibrary.CV2,
+                command=self.update_format_visibility
+            )
+            radio.pack(pady=2)
+            create_tooltip(radio, format_supported_formats(library_info[ProcessingLibrary.CV2]['formats']['output']))
+        
+        if HAVE_VIPS:
+            radio = ctk.CTkRadioButton(
+                library_frame,
+                text=library_info[ProcessingLibrary.VIPS]['name'],
+                variable=self.processing_lib,
+                value=ProcessingLibrary.VIPS,
+                command=self.update_format_visibility
+            )
+            radio.pack(pady=2)
+            create_tooltip(radio, format_supported_formats(library_info[ProcessingLibrary.VIPS]['formats']['output']))
+
         # Save button
         save_btn = ctk.CTkButton(
             settings_scroll,
@@ -715,7 +1432,7 @@ class AmiFile(ctk.CTk):
         
         ctk.CTkLabel(
             version_frame,
-            text=f"{self.loc.get('version')}: 1.1",
+            text=f"{self.loc.get('version')}: 1.2",
             anchor="w"
         ).pack(side="left", padx=10)
         
@@ -743,21 +1460,8 @@ class AmiFile(ctk.CTk):
         )
         github_button.pack(side="left", padx=10)
 
-    def toggle_format(self, format_name):
-        """Update visible formats list when checkbox is toggled"""
-        if self.format_vars[format_name].get():
-            if format_name not in self.visible_formats:
-                self.visible_formats.append(format_name)
-        else:
-            if format_name in self.visible_formats:
-                self.visible_formats.remove(format_name)
-        
-        # Update convert tab immediately
-        for widget in self.tab_convert.winfo_children():
-            widget.destroy()
-        self.setup_convert_tab()
-
     def setup_convert_tab(self):
+        """Обновленная версия с двумя прогресс-барами"""
         # File selection frame
         file_frame = ctk.CTkFrame(self.tab_convert)
         file_frame.pack(fill="x", padx=20, pady=10)
@@ -815,12 +1519,46 @@ class AmiFile(ctk.CTk):
         )
         convert_btn.pack(pady=20)
         
-        # Progress bar
-        self.progress_convert = ctk.CTkProgressBar(self.tab_convert, width=400)
-        self.progress_convert.pack(pady=10)
+        # Progress frame with translations
+        progress_frame = ctk.CTkFrame(self.tab_convert)
+        progress_frame.pack(fill="x", padx=20, pady=10)
+        
+        # Current file progress
+        self.current_progress_label = ctk.CTkLabel(
+            progress_frame, 
+            text=f"{self.loc.get('progress_current')}0/0"
+        )
+        self.current_progress_label.pack(pady=2)
+        
+        self.progress_convert = ctk.CTkProgressBar(progress_frame, width=400)
+        self.progress_convert.pack(pady=2)
         self.progress_convert.set(0)
+        
+        self.current_time_label = ctk.CTkLabel(
+            progress_frame, 
+            text=f"{self.loc.get('progress_time')}--"
+        )
+        self.current_time_label.pack(pady=2)
+        
+        # Overall progress
+        self.total_progress_label = ctk.CTkLabel(
+            progress_frame, 
+            text=f"{self.loc.get('progress_overall')}0/0"
+        )
+        self.total_progress_label.pack(pady=2)
+        
+        self.total_progress = ctk.CTkProgressBar(progress_frame, width=400)
+        self.total_progress.pack(pady=2)
+        self.total_progress.set(0)
+        
+        self.eta_label = ctk.CTkLabel(
+            progress_frame, 
+            text=f"{self.loc.get('progress_eta')}--"
+        )
+        self.eta_label.pack(pady=2)
 
     def setup_merge_tab(self):
+        """Setup merge tab UI"""
         # File selection frame
         file_frame = ctk.CTkFrame(self.tab_merge)
         file_frame.pack(fill="x", padx=20, pady=10)
@@ -885,36 +1623,56 @@ class AmiFile(ctk.CTk):
         self.progress_merge.set(0)
 
     def select_input_convert(self):
-        choice = messagebox.askquestion(
-            self.loc.get("select_images"),
-            self.loc.get("select_folder")
-        )
-        if choice == "yes":
+        """Выбор файлов/папки для конвертации"""
+        def select_folder():
             path = filedialog.askdirectory(title=self.loc.get("select_images"))
-        else:
-            path = ";".join(filedialog.askopenfilenames(
+            if path:
+                self.entry_convert.delete(0, "end")
+                self.entry_convert.insert(0, path)
+
+        def select_files():
+            files = filedialog.askopenfilenames(
                 title=self.loc.get("select_images"),
                 filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.ico *.ppm *.svg *.pdf *.eps *.psd *.heic *.avif *.jpegxl *.rla *.pcx *.pnm *.xbm *.tga *.djvu")]
-            ))
-        if path:
-            self.entry_convert.delete(0, "end")
-            self.entry_convert.insert(0, path)
+            )
+            if files:
+                path = ";".join(files)
+                self.entry_convert.delete(0, "end")
+                self.entry_convert.insert(0, path)
+
+        SelectionDialog(
+            self,
+            self.loc.get("select_images"),
+            self.loc.get("select_folder"),
+            select_folder,
+            select_files
+        )
 
     def select_input_merge(self):
-        choice = messagebox.askquestion(
-            self.loc.get("select_images"),
-            self.loc.get("select_folder")
-        )
-        if choice == "yes":
+        """Выбор файлов/папки для склеивания"""
+        def select_folder():
             path = filedialog.askdirectory(title=self.loc.get("select_images"))
-        else:
-            path = ";".join(filedialog.askopenfilenames(
+            if path:
+                self.entry_merge.delete(0, "end")
+                self.entry_merge.insert(0, path)
+
+        def select_files():
+            files = filedialog.askopenfilenames(
                 title=self.loc.get("select_images"),
                 filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp *.ico *.ppm *.svg *.pdf *.eps *.psd *.heic *.avif *.jpegxl *.rla *.pcx *.pnm *.xbm *.tga *.djvu")]
-            ))
-        if path:
-            self.entry_merge.delete(0, "end")
-            self.entry_merge.insert(0, path)
+            )
+            if files:
+                path = ";".join(files)
+                self.entry_merge.delete(0, "end")
+                self.entry_merge.insert(0, path)
+
+        SelectionDialog(
+            self,
+            self.loc.get("select_images"),
+            self.loc.get("select_folder"),
+            select_folder,
+            select_files
+        )
 
     def add_range(self):
         range_frame = ctk.CTkFrame(self.scrollable_frame)
@@ -944,188 +1702,301 @@ class AmiFile(ctk.CTk):
         
         self.range_entries.append((start_entry, end_entry))
 
+    def update_progress(self, file_progress, progress_info):
+        """Обновляет информацию о прогрессе"""
+        self.after(0, lambda: self._update_progress_ui(file_progress, progress_info))
+
+    def _update_progress_ui(self, file_progress, progress_info):
+        """Обновляет UI прогресса в главном потоке с переводами"""
+        # Обновляем прогресс текущего файла
+        self.progress_convert.set(file_progress)
+        self.current_progress_label.configure(
+            text=f"{self.loc.get('progress_current')}{progress_info.processed_files}/{progress_info.total_files}"
+        )
+        
+        # Обновляем общий прогресс
+        total_progress = progress_info.processed_files / progress_info.total_files
+        self.total_progress.set(total_progress)
+        self.total_progress_label.configure(
+            text=f"{self.loc.get('progress_overall')}{progress_info.processed_files}/{progress_info.total_files}"
+        )
+        
+        # Обновляем метки времени
+        if progress_info.avg_file_time > 0:
+            time_per_file = f"{self.loc.get('progress_time')}{progress_info.avg_file_time:.1f}s"
+            self.current_time_label.configure(text=time_per_file)
+            
+            eta = progress_info.get_eta()
+            self.eta_label.configure(text=f"{self.loc.get('progress_eta')}{eta}")
+        
+        # Обновляем UI
+        self.update_idletasks()
+
     def convert_images(self):
-        input_path = self.entry_convert.get()
-        if not input_path:
-            messagebox.showerror(
-                self.loc.get("error"),
-                self.loc.get("no_images")
-            )
+        """Обновленная версия с поддержкой расширенного прогресса"""
+        if self.conversion_running:
             return
+            
+        self.conversion_running = True
+        input_path = self.entry_convert.get()
+        
+        if not input_path:
+            messagebox.showerror(self.loc.get("error"), self.loc.get("no_images"))
+            self.conversion_running = False
+            return
+                
         output_format = self.format_var.get()
         output_folder = filedialog.askdirectory(title=self.loc.get("select_save_folder"))
         if not output_folder:
+            self.conversion_running = False
             return
+
+        # Set of valid extensions for quick lookup
+        valid_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', 
+                           '.webp', '.svg', '.pdf', '.eps', '.psd', '.heic',
+                           '.avif', '.jpegxl', '.ico', '.ppm', '.rla', '.pcx',
+                           '.pnm', '.xbm', '.tga', '.djvu'}
         
         # Get image files
         if os.path.isdir(input_path):
-            images = sorted([
+            images = [
                 os.path.join(input_path, f) for f in os.listdir(input_path)
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', 
-                                       '.webp', '.svg', '.pdf', '.eps', '.psd', 
-                                       '.heic', '.avif', '.jpegxl', '.ico', '.ppm',
-                                       '.rla', '.pcx', '.pnm', '.xbm', '.tga', '.djvu'))
-            ])
+                if os.path.splitext(f.lower())[1] in valid_extensions
+            ]
         else:
-            images = sorted(input_path.split(";"))
+            images = [f for f in input_path.split(";") if os.path.splitext(f.lower())[1] in valid_extensions]
         
         if not images:
-            messagebox.showerror(
-                self.loc.get("error"),
-                self.loc.get("no_images")
-            )
+            messagebox.showerror(self.loc.get("error"), self.loc.get("no_images"))
+            self.conversion_running = False
             return
+
+        # Prepare conversion arguments
+        needs_alpha_removal = output_format in ['jpg', 'jpeg', 'bmp']
+        conversion_args = []
         
-        # Update progress bar
-        self.progress_convert.configure(determinate_speed=1 / len(images))
-        self.progress_convert.start()
+        lib = self.processing_lib.get()
+        supported_input = SUPPORTED_FORMATS[lib]['input']
         
+        # Фильтруем изображения по поддерживаемым форматам
+        images = [img for img in images 
+                 if os.path.splitext(img.lower())[1][1:] in supported_input]
+        
+        if not images:
+            messagebox.showerror(self.loc.get("error"), 
+                               "No supported images found for selected processing library")
+            self.conversion_running = False
+            return
+
         for input_path in images:
+            output_path = os.path.join(
+                output_folder,
+                f"{os.path.splitext(os.path.basename(input_path))[0]}.{output_format}"
+            )
+            conversion_args.append((input_path, output_path, output_format, needs_alpha_removal))
+
+        # Запускаем конвертацию в отдельном потоке
+        def conversion_thread():
             try:
-                with Image(filename=input_path) as img:
-                    # Handle transparency for formats that don't support it
-                    if output_format in ['jpg', 'jpeg', 'bmp'] and img.alpha_channel:
-                        with Color('white') as background:
-                            img.background_color = background
-                            img.alpha_channel = 'remove'
-                    
-                    # Preserve original filename, just change extension
-                    output_path = os.path.join(
-                        output_folder,
-                        f"{os.path.splitext(os.path.basename(input_path))[0]}.{output_format}"
-                    )
-                    
-                    # Save the converted image
-                    img.convert(output_format)
-                    img.save(filename=output_path)
-            
-            except Exception as e:
-                messagebox.showerror(
-                    self.loc.get("error"),
-                    self.loc.get("conversion_error").format(input_path, str(e))
-                )
+                # Сбрасываем прогресс
+                self.progress_convert.set(0)
+                self.total_progress.set(0)
+                
+                # Конвертируем изображения
+                errors = batch_convert(conversion_args, self.update_progress, batch_size=10)
+                
+                # Показываем результаты
+                self.after(0, lambda: self.show_conversion_results(errors))
+            finally:
+                self.conversion_running = False
         
-        # Finalize progress
-        self.progress_convert.stop()
-        self.progress_convert.set(1)
-        messagebox.showinfo(
-            self.loc.get("success"),
-            self.loc.get("conversion_complete")
-        )
+        threading.Thread(target=conversion_thread, daemon=True).start()
+
+    def show_conversion_results(self, errors):
+        """Показывает результаты конвертации с улучшенным дизайном"""
+        if errors:
+            dialog = CustomDialog(
+                self,
+                title=self.loc.get("error"),
+                message="\n".join(
+                    self.loc.get("conversion_error").format(path, error)
+                    for path, error in errors
+                ),
+                button_color="red",
+                button_hover_color="#8B0000"
+            )
+        else:
+            dialog = CustomDialog(
+                self,
+                title=self.loc.get("success"),
+                message=self.loc.get("conversion_complete"),
+                button_color="green",
+                button_hover_color="#006400"
+            )
+        dialog.wait_window()
 
     def merge_images(self):
-        input_path = self.entry_merge.get()
-        if not input_path:
-            messagebox.showerror(
-                self.loc.get("error"),
-                self.loc.get("no_merge_images")
-            )
+        """Обновленная версия с исправленным скроллом"""
+        if self.merge_running:
             return
+            
+        self.merge_running = True
+        input_path = self.entry_merge.get()
         
+        if not input_path:
+            dialog = CustomDialog(
+                self,
+                title=self.loc.get("error"),
+                message=self.loc.get("no_merge_images"),
+                button_color="red",
+                button_hover_color="#8B0000"
+            )
+            dialog.wait_window()
+            self.merge_running = False
+            return
+
+        # Проверяем были ли добавлены диапазоны
+        if not self.range_entries:
+            dialog = CustomDialog(
+                self,
+                title=self.loc.get("error"),
+                message=self.loc.get("no_merge_images"),
+                button_color="red",
+                button_hover_color="#8B0000"
+            )
+            dialog.wait_window()
+            self.merge_running = False
+            return
+
+        # Кэшируем проверку расширений
+        valid_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.gif', '.tiff', 
+                           '.webp', '.svg', '.pdf', '.eps', '.psd', '.heic',
+                           '.avif', '.jpegxl', '.ico', '.ppm', '.rla', '.pcx',
+                           '.pnm', '.xbm', '.tga', '.djvu'}
+
         if os.path.isdir(input_path):
             images = sorted([
                 os.path.join(input_path, f) for f in os.listdir(input_path)
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', 
-                                       '.tiff', '.webp', '.svg', '.pdf', '.eps', '.psd', 
-                                       '.heic', '.avif', '.jpegxl', '.ico', '.ppm',
-                                       '.rla', '.pcx', '.pnm', '.xbm', '.tga', '.djvu'))
+                if os.path.splitext(f.lower())[1] in valid_extensions
             ])
         else:
-            images = sorted(input_path.split(";"))
+            images = sorted([f for f in input_path.split(";") if os.path.splitext(f.lower())[1] in valid_extensions])
         
         if not images:
-            messagebox.showerror(
-                self.loc.get("error"),
-                self.loc.get("no_merge_images")
+            dialog = CustomDialog(
+                self,
+                title=self.loc.get("error"),
+                message=self.loc.get("no_merge_images"),
+                button_color="red",
+                button_hover_color="#8B0000"
             )
+            dialog.wait_window()
+            self.merge_running = False
             return
         
         output_folder = filedialog.askdirectory(title=self.loc.get("select_save_folder"))
         if not output_folder:
+            self.merge_running = False
             return
         
-        self.progress_merge.configure(determinate_speed=1 / len(self.range_entries))
-        self.progress_merge.start()
-        
-        for i, (start_entry, end_entry) in enumerate(self.range_entries):
+        def merge_thread():
             try:
-                start_index = int(start_entry.get()) - 1
-                end_index = int(end_entry.get())
-            except ValueError:
-                messagebox.showerror(
-                    self.loc.get("error"),
-                    self.loc.get("invalid_range").format(i + 1)
-                )
-                continue
-            
-            range_images = images[start_index:end_index]
-            if not range_images:
-                messagebox.showerror(
-                    self.loc.get("error"),
-                    self.loc.get("no_range_images").format(i + 1)
-                )
-                continue
-            
-            try:
-                # Open images with Wand
-                imgs = [Image(filename=img) for img in range_images]
-            except Exception as e:
-                messagebox.showerror(
-                    self.loc.get("error"),
-                    self.loc.get("loading_error").format(e)
-                )
-                continue
-            
-            try:
-                if self.direction_var.get() == "horizontal":
-                    # Calculate total width and max height
-                    total_width = sum(img.width for img in imgs)
-                    max_height = max(img.height for img in imgs)
-                    
-                    # Create a new image
-                    with Image(width=total_width, height=max_height, background=Color('white')) as new_img:
-                        x_offset = 0
-                        for img in imgs:
-                            new_img.composite(img, left=x_offset, top=0)
-                            x_offset += img.width
-                        
-                        # Save the merged image
-                        output_path = os.path.join(output_folder, f"{i + 1}.{self.merge_format_var.get()}")
-                        new_img.save(filename=output_path)
+                self.progress_merge.start()
                 
-                else:  # Vertical merging
-                    # Calculate total height and max width
-                    total_height = sum(img.height for img in imgs)
-                    max_width = max(img.width for img in imgs)
-                    
-                    # Create a new image
-                    with Image(width=max_width, height=total_height, background=Color('white')) as new_img:
-                        y_offset = 0
-                        for img in imgs:
-                            new_img.composite(img, left=0, top=y_offset)
-                            y_offset += img.height
+                for i, (start_entry, end_entry) in enumerate(self.range_entries):
+                    try:
+                        start_index = int(start_entry.get()) - 1
+                        end_index = int(end_entry.get())
+                        range_images = images[start_index:end_index]
                         
-                        # Save the merged image
+                        if not range_images:
+                            raise ValueError(f"No images in range {i + 1}")
+                            
                         output_path = os.path.join(output_folder, f"{i + 1}.{self.merge_format_var.get()}")
-                        new_img.save(filename=output_path)
+                        merge_images_optimized(
+                            range_images, 
+                            direction=self.direction_var.get(),
+                            output_path=output_path,
+                            output_format=self.merge_format_var.get()
+                        )
+                        
+                        # Обновляем прогресс
+                        progress = (i + 1) / len(self.range_entries)
+                        self.after(0, lambda p=progress: self.progress_merge.set(p))
+                        
+                    except Exception as e:
+                        self.after(0, lambda: CustomDialog(
+                            self,
+                            title=self.loc.get("error"),
+                            message=self.loc.get("saving_error").format(i + 1, str(e)),
+                            button_color="red",
+                            button_hover_color="#8B0000"
+                        ).wait_window())
+                        continue
                 
-            except Exception as e:
-                messagebox.showerror(
-                    self.loc.get("error"),
-                    self.loc.get("saving_error").format(i + 1, e)
-                )
+                # Показываем сообщение об успешном завершении
+                self.after(0, lambda: CustomDialog(
+                    self,
+                    title=self.loc.get("success"),
+                    message=self.loc.get("merge_complete"),
+                    button_color="green",
+                    button_hover_color="#006400"
+                ).wait_window())
+                
+            finally:
+                self.merge_running = False
+                self.after(0, lambda: self.progress_merge.stop())
+                self.after(0, lambda: self.progress_merge.set(1))
         
-        # Close any remaining open images
-        for img_list in imgs:
-            img_list.close()
-        
-        self.progress_merge.stop()
-        self.progress_merge.set(1)
-        messagebox.showinfo(
-            self.loc.get("success"),
-            self.loc.get("merge_complete")
-        )
+        # Запускаем процесс склейки в отдельном потоке
+        threading.Thread(target=merge_thread, daemon=True).start()
 
+    def update_format_visibility(self):
+        """Обновляет видимость форматов в зависимости от выбранной библиотеки"""
+        lib = self.processing_lib.get()
+        supported = SUPPORTED_FORMATS[lib]['output']
+        
+        # Автоматически восстанавливаем форматы в зависимости от библиотеки
+        if lib == ProcessingLibrary.WAND:
+            # Для Wand включаем все форматы
+            self.visible_formats = [
+                "PNG", "JPEG", "GIF", "WEBP", "BMP", "TIFF", "SVG", "PDF", 
+                "EPS", "PSD", "HEIC", "AVIF", "JPEGXL", "ICO", "PPM",
+                "RLA", "PCX", "PNM", "XBM", "TGA", "DJVU"
+            ]
+        elif lib == ProcessingLibrary.VIPS:
+            # Для Pyvips включаем поддерживаемые форматы
+            self.visible_formats = [
+                fmt.upper() for fmt in SUPPORTED_FORMATS['vips']['output']
+            ]
+        elif lib == ProcessingLibrary.PIL:
+            # Для PIL включаем только поддерживаемые форматы
+            self.visible_formats = [
+                fmt.upper() for fmt in SUPPORTED_FORMATS['pil']['output']
+            ]
+        else:  # CV2
+            # Для OpenCV включаем только его форматы
+            self.visible_formats = [
+                fmt.upper() for fmt in SUPPORTED_FORMATS['cv2']['output']
+            ]
+        
+        # Обновляем чекбоксы
+        for fmt, var in self.format_vars.items():
+            if lib == ProcessingLibrary.WAND:
+                # Для Wand включаем все форматы
+                var.set(fmt in self.visible_formats)
+                self.format_vars[fmt]._checkbox.configure(state="normal")
+            else:
+                # Для других библиотек проверяем поддержку
+                if fmt.lower() in supported:
+                    var.set(True)  # Автоматически включаем поддерживаемые форматы
+                    self.format_vars[fmt]._checkbox.configure(state="normal")
+                else:
+                    var.set(False)
+                    self.format_vars[fmt]._checkbox.configure(state="disabled")
+        
+        # Обновляем интерфейс
+        self.refresh_interface()
 
 if __name__ == "__main__":
     app = AmiFile()
